@@ -1,6 +1,6 @@
 ---
 name: XiaoAir
-version: "0.1.22"
+version: "0.1.28"
 slug: xiaoair
 description: AirPlay bridge to Home Assistant media_player entities (e.g. XiaoAI).
 url: https://github.com/yakamoz423/xiaoair
