@@ -6,9 +6,9 @@ Starts a reconnectable HTTP MP3 stream from the Shairport pipe and calls
 media_player.play_media on the configured Home Assistant entity.
 
 Timing (important for XiaoAI):
-  before_play_begins -> snapshot speaker volume, start HTTP/ffmpeg (no play_media yet)
+  before_play_begins -> start HTTP/ffmpeg (no play_media yet)
   after_play_begins  -> wait until audio bytes flow, then play_media
-  after_play_ends    -> soft-stop speaker, restore pre-connect volume, tear down stream
+  after_play_ends    -> soft-stop speaker, restore configured volume, tear down stream
 """
 from __future__ import annotations
 
@@ -89,15 +89,25 @@ def audio_ready_path(entity_id: str) -> str:
     return f"/tmp/shairport_audio_ready_{entity_id.replace('.', '_')}"
 
 
-def volume_snapshot_path(entity_id: str) -> str:
-    return f"/tmp/shairport_pre_volume_{entity_id.replace('.', '_')}.json"
-
-
 def restore_volume_enabled() -> bool:
     value = load_options().get("restore_volume_on_disconnect", True)
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off"}
     return bool(value)
+
+
+def configured_restore_volume() -> float:
+    """Preset volume (0..1) from addon option restore_volume_percent (default 20)."""
+    raw = load_options().get("restore_volume_percent", 20)
+    try:
+        percent = float(raw)
+    except (TypeError, ValueError):
+        percent = 20.0
+    if percent < 0.0:
+        percent = 0.0
+    if percent > 100.0:
+        percent = 100.0
+    return percent / 100.0
 
 
 def ha_headers() -> Dict[str, str]:
@@ -377,85 +387,6 @@ def run_serve(entity_id: str, pipe_path: str, port_offset: int) -> None:
             pass
 
 
-def ha_get_state(entity_id: str) -> Optional[Dict[str, Any]]:
-    token = supervisor_token()
-    if not token:
-        return None
-    try:
-        response = requests.get(
-            f"http://supervisor/core/api/states/{entity_id}",
-            headers=ha_headers(),
-            timeout=8,
-        )
-        if response.status_code >= 400:
-            log(f"✗ get state {entity_id}: {response.status_code} {response.text[:160]}")
-            return None
-        payload = response.json()
-        return payload if isinstance(payload, dict) else None
-    except Exception as err:  # noqa: BLE001
-        log(f"✗ get state {entity_id}: {err}")
-        return None
-
-
-def volume_from_ha_state(state: Optional[Dict[str, Any]]) -> Optional[float]:
-    if not state:
-        return None
-    attrs = state.get("attributes") or {}
-    raw_level = attrs.get("volume_level")
-    if raw_level is None:
-        return None
-    try:
-        level = float(raw_level)
-    except (TypeError, ValueError):
-        return None
-    if level < 0.0:
-        level = 0.0
-    if level > 1.0:
-        level = 1.0
-    return level
-
-
-def load_volume_snapshot(entity_id: str) -> Optional[Dict[str, Any]]:
-    snap = load_json(volume_snapshot_path(entity_id))
-    if snap.get("volume_level") is None:
-        return None
-    return snap
-
-
-def save_volume_snapshot(entity_id: str, snap: Dict[str, Any]) -> None:
-    try:
-        with open(volume_snapshot_path(entity_id), "w", encoding="utf-8") as handle:
-            json.dump(snap, handle)
-    except OSError as err:
-        log(f"✗ volume snapshot write failed: {err}")
-
-
-def clear_volume_snapshot(entity_id: str) -> None:
-    try:
-        os.remove(volume_snapshot_path(entity_id))
-    except OSError:
-        pass
-
-
-def snapshot_pre_volume(entity_id: str) -> Optional[float]:
-    """Remember speaker volume once per AirPlay session, before iPhone overrides it."""
-    if not restore_volume_enabled():
-        return None
-    existing = load_volume_snapshot(entity_id)
-    if existing is not None:
-        try:
-            return float(existing["volume_level"])
-        except (TypeError, ValueError, KeyError):
-            pass
-    level = volume_from_ha_state(ha_get_state(entity_id))
-    if level is None:
-        log(f"volume snapshot skipped (no volume_level on {entity_id})")
-        return None
-    save_volume_snapshot(entity_id, {"volume_level": level})
-    log(f"saved pre-connect volume={level:.3f}")
-    return level
-
-
 def set_ha_volume(entity_id: str, level: float) -> Tuple[bool, str]:
     """media_player.volume_set only — never touch mute."""
     ok, detail = call_service(
@@ -470,26 +401,15 @@ def set_ha_volume(entity_id: str, level: float) -> Tuple[bool, str]:
 def restore_pre_volume(entity_id: str) -> None:
     """One volume_set after pause. Do not change mute."""
     if not restore_volume_enabled():
-        clear_volume_snapshot(entity_id)
         return
-    snap = load_volume_snapshot(entity_id)
-    if snap is None:
-        log("no pre-connect volume to restore")
-        return
-    try:
-        level = float(snap["volume_level"])
-    except (TypeError, ValueError, KeyError):
-        log(f"✗ bad pre-connect volume snapshot: {snap!r}")
-        clear_volume_snapshot(entity_id)
-        return
-
-    log(f"restoring pre-connect volume={level:.3f}")
+    level = configured_restore_volume()
+    percent = round(level * 100.0)
+    log(f"restoring configured volume={level:.3f} ({percent}%)")
     ok, detail = set_ha_volume(entity_id, level)
     if ok:
         log(f"✓ {detail}")
     else:
         log(f"✗ restore {detail}")
-    clear_volume_snapshot(entity_id)
 
 
 def call_service(service: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
@@ -586,7 +506,6 @@ def handle_start(entity_id: str, pipe_path: str, port_offset: str) -> None:
 
     log(f"Playback starting for {entity_id}")
     log(f"pipe={pipe_path} url={stream_url} token={'yes' if supervisor_token() else 'no'}")
-    snapshot_pre_volume(entity_id)
 
     stop_serve(entity_id)
     wait_port_free(port)
@@ -676,9 +595,6 @@ def handle_volume(entity_id: str, airplay_db_raw: str) -> None:
     except ValueError:
         log(f"✗ volume: bad value {airplay_db_raw!r}")
         return
-
-    # Volume may arrive before before_play_begins — snapshot first.
-    snapshot_pre_volume(entity_id)
 
     level = airplay_volume_to_ha(airplay_db)
     log(f"volume airplay={airplay_db} dB -> ha={level:.3f}")

@@ -47,6 +47,8 @@ configuration:
   restore_volume_on_disconnect:
     name: Restore volume after disconnect
     description: >-
-      Save the speaker volume when AirPlay connects, then restore it
-      after the session ends. iPhone volume keys still control the
-      speaker during playback.
+      After AirPlay ends, set the speaker to the percentage below.
+      iPhone volume keys still control the speaker during playback.
+  restore_volume_percent:
+    name: Restore volume percent
+    description: Volume to apply after disconnect (0–100, default 20).
